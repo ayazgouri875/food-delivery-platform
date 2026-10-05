@@ -3,12 +3,14 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.database import Base, engine
-import app.models  # Ensures all ORM models (User, Restaurant, Menu, Cart, Address) are registered
+import app.models  # Ensures all ORM models are registered before create_all
 from app.routers import (
     address_router,
     auth_router,
     cart_router,
     menu_router,
+    orders_router,
+    payments_router,
     restaurants_router,
     users_router,
 )
@@ -31,6 +33,8 @@ app.include_router(restaurants_router)
 app.include_router(menu_router)
 app.include_router(cart_router)
 app.include_router(address_router)
+app.include_router(orders_router)
+app.include_router(payments_router)
 
 
 @app.get("/", tags=["General"])
