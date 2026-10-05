@@ -3,8 +3,8 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.database import Base, engine
-from app.models import User  # Ensures models are imported before create_all
-from app.routers import auth_router, users_router
+import app.models  # Ensures all ORM models (User, Restaurant, Menu) are registered
+from app.routers import auth_router, menu_router, restaurants_router, users_router
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -20,6 +20,8 @@ Base.metadata.create_all(bind=engine)
 # Mount domain routers
 app.include_router(auth_router)
 app.include_router(users_router)
+app.include_router(restaurants_router)
+app.include_router(menu_router)
 
 
 @app.get("/", tags=["General"])
