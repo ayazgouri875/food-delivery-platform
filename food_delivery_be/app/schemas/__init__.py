@@ -1,3 +1,10 @@
+from app.schemas.address import AddressCreate, AddressResponse
+from app.schemas.cart import (
+    CartItemAdd,
+    CartItemResponse,
+    CartItemUpdate,
+    CartResponse,
+)
 from app.schemas.menu import (
     MenuCategoryCreate,
     MenuCategoryResponse,
@@ -44,4 +51,10 @@ __all__ = [
     "MenuItemAvailabilityUpdate",
     "MenuItemResponse",
     "RestaurantFullMenuResponse",
+    "CartItemAdd",
+    "CartItemUpdate",
+    "CartItemResponse",
+    "CartResponse",
+    "AddressCreate",
+    "AddressResponse",
 ]

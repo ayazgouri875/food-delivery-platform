@@ -3,8 +3,15 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.database import Base, engine
-import app.models  # Ensures all ORM models (User, Restaurant, Menu) are registered
-from app.routers import auth_router, menu_router, restaurants_router, users_router
+import app.models  # Ensures all ORM models (User, Restaurant, Menu, Cart, Address) are registered
+from app.routers import (
+    address_router,
+    auth_router,
+    cart_router,
+    menu_router,
+    restaurants_router,
+    users_router,
+)
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -22,6 +29,8 @@ app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(restaurants_router)
 app.include_router(menu_router)
+app.include_router(cart_router)
+app.include_router(address_router)
 
 
 @app.get("/", tags=["General"])
