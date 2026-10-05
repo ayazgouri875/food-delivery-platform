@@ -8,6 +8,7 @@ from app.routers import (
     address_router,
     auth_router,
     cart_router,
+    delivery_router,
     menu_router,
     orders_router,
     payments_router,
@@ -35,6 +36,7 @@ app.include_router(cart_router)
 app.include_router(address_router)
 app.include_router(orders_router)
 app.include_router(payments_router)
+app.include_router(delivery_router)
 
 
 @app.get("/", tags=["General"])
