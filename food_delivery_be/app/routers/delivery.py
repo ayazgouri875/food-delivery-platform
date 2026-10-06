@@ -144,7 +144,8 @@ def assign_delivery_partner(
        - is_busy == False
     4. Locks partner as busy and creates Delivery record.
     """
-    order = db.query(Order).filter(Order.id == order_id).first()
+    # Lock the Order row to prevent concurrent duplicate dispatches for the same order
+    order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
@@ -154,7 +155,7 @@ def assign_delivery_partner(
             detail=f"Cannot assign delivery for order in '{order.status}' status."
         )
 
-    # Check for existing delivery
+    # Check for existing delivery (safe under Order row lock)
     existing_delivery = db.query(Delivery).filter(
         Delivery.order_id == order.id,
         Delivery.status != DeliveryStatus.CANCELLED
@@ -169,12 +170,19 @@ def assign_delivery_partner(
     if not restaurant:
         raise HTTPException(status_code=404, detail="Restaurant not found")
 
-    # Find available partner in the restaurant's city
-    partner = db.query(DeliveryPartner).filter(
-        DeliveryPartner.current_city.ilike(restaurant.city),
-        DeliveryPartner.is_online == True,
-        DeliveryPartner.is_busy == False
-    ).first()
+    # Find available partner using SELECT FOR UPDATE SKIP LOCKED
+    # This prevents double-booking and allows concurrent dispatch workers to
+    # safely grab different riders simultaneously without lock contention!
+    partner = (
+        db.query(DeliveryPartner)
+        .filter(
+            DeliveryPartner.current_city.ilike(restaurant.city),
+            DeliveryPartner.is_online == True,
+            DeliveryPartner.is_busy == False
+        )
+        .with_for_update(skip_locked=True)
+        .first()
+    )
 
     if not partner:
         raise HTTPException(

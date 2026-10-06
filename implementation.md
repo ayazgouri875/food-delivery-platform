@@ -234,23 +234,37 @@ The security architecture is decoupled into **Cryptographic Utilities** and **Fa
 ### 7. Orders Domain ([app/routers/orders.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/orders.py))
 | Method | Endpoint | Access | Concurrency Guard | Request Body / Params | Response Model | Status Code |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `POST` | `/orders/` | Authenticated | **`SELECT FOR UPDATE`** | `OrderCreate` (delivery_address_id, notes) | `OrderResponse` | `201 Created` |
+| `POST` | `/orders/` | Authenticated | **Redis Distributed Lock + Idempotency Replay + Deterministic `SELECT FOR UPDATE`** | `OrderCreate` (delivery_address_id, notes, idempotency_key) / Header `X-Idempotency-Key` | `OrderResponse` | `201 Created` (or `200` replay, `409` in-flight) |
 | `GET` | `/orders/` | Authenticated | None | `skip: int, limit: int` | `List[OrderResponse]` | `200 OK` |
 | `GET` | `/orders/{id}` | Participant or `ADMIN` | None | None | `OrderDetailResponse` | `200 OK` |
 | `PATCH` | `/orders/{id}/status` | Restaurant, Admin | FSM validation | `OrderStatusUpdate` (status, notes) | `OrderDetailResponse` | `200 OK` |
-| `POST` | `/orders/{id}/cancel` | Customer, Restaurant | FSM guard | `notes: str` | `OrderDetailResponse` | `200 OK` |
+| `POST` | `/orders/{id}/cancel` | Customer, Restaurant | FSM guard + stock restoral | `notes: str` | `OrderDetailResponse` | `200 OK` |
 
 ### 8. Payments Domain ([app/routers/payments.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/payments.py))
-| Method | Endpoint | Access | Idempotency Check | Request Body / Params | Response Model | Status Code |
+| Method | Endpoint | Access | Concurrency Guard | Request Body / Params | Response Model | Status Code |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `POST` | `/payments/` | Authenticated | **`idempotency_key UNIQUE`** | `PaymentInitiate` (order_id, payment_method, idempotency_key, should_succeed) | `PaymentResponse` | `200 OK` |
+| `POST` | `/payments/` | Authenticated | **Distributed Lock on `idempotency_key` + `SELECT FOR UPDATE` on Order** | `PaymentInitiate` (order_id, payment_method, idempotency_key, should_succeed) | `PaymentResponse` | `200 OK` |
 
 ### 9. Delivery Domain ([app/routers/delivery.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/delivery.py))
-| Method | Endpoint | Access | State Sync Effect | Request Body / Params | Response Model | Status Code |
+| Method | Endpoint | Access | Concurrency Guard | Request Body / Params | Response Model | Status Code |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | `POST` | `/delivery/partner/profile` | `DELIVERY_PARTNER`, `ADMIN` | None | `DeliveryPartnerProfile` | `DeliveryPartnerResponse` | `200 OK` |
 | `GET` | `/delivery/partner/me` | `DELIVERY_PARTNER`, `ADMIN` | None | None | `DeliveryPartnerResponse` | `200 OK` |
-| `PATCH` | `/delivery/partner/status` | `DELIVERY_PARTNER`, `ADMIN` | Online/Offline | `DeliveryPartnerToggleOnline` | `DeliveryPartnerResponse` | `200 OK` |
-| `POST` | `/delivery/assign/{order_id}` | Authenticated | City-matched rider lock | None | `DeliveryResponse` | `200 OK` |
+| `PATCH` | `/delivery/partner/status` | `DELIVERY_PARTNER`, `ADMIN` | Online/Offline toggle | `DeliveryPartnerToggleOnline` | `DeliveryPartnerResponse` | `200 OK` |
+| `POST` | `/delivery/assign/{order_id}` | Authenticated | **Order Row Lock + Partner `SELECT FOR UPDATE SKIP LOCKED`** | None | `DeliveryResponse` | `200 OK` (or `503`) |
 | `GET` | `/delivery/my-deliveries` | `DELIVERY_PARTNER` | None | None | `List[DeliveryResponse]` | `200 OK` |
-| `PATCH` | `/delivery/{id}/status` | `DELIVERY_PARTNER`, `ADMIN` | Syncs `order.status` & rider lock | `DeliveryStatusUpdate` | `DeliveryResponse` | `200 OK` |
+| `PATCH` | `/delivery/{id}/status` | `DELIVERY_PARTNER`, `ADMIN` | Syncs `order.status` & releases partner lock | `DeliveryStatusUpdate` | `DeliveryResponse` | `200 OK` |
+
+---
+
+## Stage 3: Concurrency & Distributed Consistency File Map
+
+| Mechanism | Primary Source File | Technical Strategy | System Guarantee |
+| :--- | :--- | :--- | :--- |
+| **Distributed Lock** | [app/core/redis.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/redis.py#L107-L146) | `redis_client.set(key, token, nx=True, ex=ttl)` + Lua script token validation | Mutual exclusion across distributed nodes; safe auto-release on crash |
+| **Order Idempotency** | [app/routers/orders.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/orders.py#L40-L75) | Fast Redis lookup (`idempotency:order:{uid}:{key}`) + PostgreSQL `orders.idempotency_key` unique column | Network retries and double clicks return same order; zero duplicate orders |
+| **Deadlock-Free Row Lock** | [app/routers/orders.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/orders.py#L117-L148) | Sort cart items by ascending `item_id` before querying `MenuItem.with_for_update()` | Dijkstra's resource hierarchy; eliminates database deadlocks |
+| **Driver Double-Booking Defense** | [app/routers/delivery.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/delivery.py#L173-L188) | `DeliveryPartner.with_for_update(skip_locked=True)` + `Order.with_for_update()` | Parallel dispatch workers claim different riders simultaneously; zero contention |
+| **Payment Deduplication** | [app/routers/payments.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/payments.py#L22-L46) | `distributed_lock(f"lock:payment:{key}")` + `Order.with_for_update()` | Prevents duplicate card/UPI debits and duplicate order confirmations |
+| **Automated Concurrency Tests** | [tests/test_concurrency.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/tests/test_concurrency.py) | `concurrent.futures.ThreadPoolExecutor` against live FastAPI + PostgreSQL + Redis | Automated stress testing: 10 parallel checkouts, 5 double taps, 3 dispatch races |
+

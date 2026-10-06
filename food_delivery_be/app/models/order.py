@@ -38,6 +38,8 @@ class Order(Base):
     subtotal = Column(Integer, nullable=False)
     delivery_fee = Column(Integer, default=4000, nullable=False)
     grand_total = Column(Integer, nullable=False)
+    # Idempotency key for preventing duplicate orders on network retries
+    idempotency_key = Column(String(100), unique=True, nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

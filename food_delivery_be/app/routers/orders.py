@@ -1,7 +1,8 @@
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from typing import List, Optional
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.redis import delete_cache, distributed_lock, get_cache, set_cache
 from app.dependencies.auth import get_current_user
 from app.dependencies.database import get_db
 from app.models.address import Address
@@ -35,136 +36,205 @@ VALID_TRANSITIONS = {
     "/",
     response_model=OrderResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Checkout cart and place an order (uses SELECT FOR UPDATE row locking)"
+    summary="Checkout cart and place an order (uses Redis Distributed Lock & Row-Level Locking)"
 )
 def place_order(
     order_in: OrderCreate,
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Checkout the customer's cart:
-    1. Validates delivery address ownership.
-    2. Uses row-level lock (SELECT FOR UPDATE) to verify and decrement inventory.
-    3. Snapshots item prices at time of purchase.
-    4. Records initial OrderStatusHistory entry.
-    5. Clears the cart within the same database transaction.
+    Checkout the customer's cart with production-grade concurrency controls:
+    1. Distributed Lock (Redis): Serializes checkout requests per-user to eliminate
+       double-tap race conditions on the mutable cart.
+    2. Distributed Idempotency: Deduplicates identical requests via Redis key + DB column,
+       replaying the existing order if already completed.
+    3. Deadlock-Free Row-Level Locking: Acquires SELECT FOR UPDATE locks on menu items
+       in strictly ascending item_id order (Dijkstra's resource hierarchy).
+    4. Price & Address Snapshotting: Freezes unit prices and delivery address in order record.
+    5. Atomic Inventory Decrement & Cart Invalidation in a single DB transaction.
     """
-    # 1. Fetch user's cart
-    cart = db.query(Cart).filter(Cart.user_id == current_user.id).first()
-    if not cart or not cart.items:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Your cart is empty. Add items before checking out."
-        )
+    idempotency_key = order_in.idempotency_key or x_idempotency_key
+    idempotency_cache_key = f"idempotency:order:{current_user.id}:{idempotency_key}" if idempotency_key else None
 
-    # 2. Fetch and format delivery address snapshot
-    address = db.query(Address).filter(
-        Address.id == order_in.delivery_address_id,
-        Address.user_id == current_user.id
-    ).first()
-    if not address:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Delivery address not found."
-        )
-    address_snapshot = f"{address.title}: {address.address_line}, {address.city} - {address.postal_code or ''}".strip()
-
-    # 3. Validate restaurant status
-    restaurant = db.query(Restaurant).filter(Restaurant.id == cart.restaurant_id).first()
-    if not restaurant or not restaurant.is_active or not restaurant.is_open:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Restaurant is currently closed or unavailable."
-        )
-
-    # 4. Inventory check and Row-Level Locking (SELECT FOR UPDATE)
-    subtotal = 0
-    order_items_to_create = []
-
-    for cart_item in cart.items:
-        # Lock this menu_item row for update to prevent concurrent overselling
-        menu_item = (
-            db.query(MenuItem)
-            .filter(MenuItem.id == cart_item.item_id)
-            .with_for_update()
-            .first()
-        )
-
-        if not menu_item or not menu_item.is_available:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"'{cart_item.item.name}' is no longer available."
-            )
-
-        # Check stock if inventory tracking is enabled (stock_count != -1)
-        if menu_item.stock_count != -1:
-            if menu_item.stock_count < cart_item.quantity:
+    # Step A: Fast-path Idempotency Check (Redis cache & DB fallback)
+    if idempotency_cache_key:
+        cached = get_cache(idempotency_cache_key)
+        if cached:
+            if cached.get("status") == "COMPLETED":
+                existing_order = db.query(Order).filter(Order.id == cached.get("order_id")).first()
+                if existing_order:
+                    return existing_order
+            elif cached.get("status") == "PROCESSING":
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Insufficient stock for '{menu_item.name}'. Only {menu_item.stock_count} portions left."
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An identical order checkout request is currently being processed. Please wait."
                 )
-            # Decrement stock atomically
-            menu_item.stock_count -= cart_item.quantity
 
-        item_subtotal = menu_item.price * cart_item.quantity
-        subtotal += item_subtotal
+        # Check PostgreSQL persistent storage in case Redis cache expired
+        existing_db_order = db.query(Order).filter(
+            Order.user_id == current_user.id,
+            Order.idempotency_key == idempotency_key
+        ).first()
+        if existing_db_order:
+            set_cache(idempotency_cache_key, {"status": "COMPLETED", "order_id": existing_db_order.id}, ttl=86400)
+            return existing_db_order
 
-        # Snapshot item details
-        order_items_to_create.append({
-            "item_id": menu_item.id,
-            "item_name": menu_item.name,
-            "unit_price": menu_item.price,
-            "quantity": cart_item.quantity,
-            "subtotal": item_subtotal
-        })
+    # Step B: Acquire Per-User Distributed Lock to serialize concurrent checkout attempts
+    user_lock_key = f"lock:checkout:user:{current_user.id}"
+    try:
+        with distributed_lock(user_lock_key, lock_timeout_seconds=15, acquire_timeout_seconds=5.0):
+            # Double-check idempotency under lock to catch concurrent in-flight requests that just completed
+            if idempotency_cache_key:
+                cached = get_cache(idempotency_cache_key)
+                if cached and cached.get("status") == "COMPLETED":
+                    existing_order = db.query(Order).filter(Order.id == cached.get("order_id")).first()
+                    if existing_order:
+                        return existing_order
 
-    delivery_fee = 4000  # Flat ₹40.00
-    grand_total = subtotal + delivery_fee
+                # Mark as PROCESSING with short 30-second TTL
+                set_cache(idempotency_cache_key, {"status": "PROCESSING"}, ttl=30)
 
-    # 5. Create Order
-    new_order = Order(
-        user_id=current_user.id,
-        restaurant_id=restaurant.id,
-        delivery_address_id=address.id,
-        delivery_address_snapshot=address_snapshot,
-        status=OrderStatus.CREATED,
-        subtotal=subtotal,
-        delivery_fee=delivery_fee,
-        grand_total=grand_total
-    )
-    db.add(new_order)
-    db.flush()
+            try:
+                # 1. Fetch user's cart
+                cart = db.query(Cart).filter(Cart.user_id == current_user.id).first()
+                if not cart or not cart.items:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Your cart is empty. Add items before checking out."
+                    )
 
-    # Create OrderItems with snapshot values
-    for item_data in order_items_to_create:
-        order_item = OrderItem(
-            order_id=new_order.id,
-            item_id=item_data["item_id"],
-            item_name=item_data["item_name"],
-            unit_price=item_data["unit_price"],
-            quantity=item_data["quantity"],
-            subtotal=item_data["subtotal"]
+                # 2. Fetch and format delivery address snapshot
+                address = db.query(Address).filter(
+                    Address.id == order_in.delivery_address_id,
+                    Address.user_id == current_user.id
+                ).first()
+                if not address:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Delivery address not found."
+                    )
+                address_snapshot = f"{address.title}: {address.address_line}, {address.city} - {address.postal_code or ''}".strip()
+
+                # 3. Validate restaurant status
+                restaurant = db.query(Restaurant).filter(Restaurant.id == cart.restaurant_id).first()
+                if not restaurant or not restaurant.is_active or not restaurant.is_open:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Restaurant is currently closed or unavailable."
+                    )
+
+                # 4. Inventory check and Deadlock-Free Row-Level Locking (SELECT FOR UPDATE)
+                subtotal = 0
+                order_items_to_create = []
+
+                # Crucial Concurrency Strategy: Sort cart items deterministically by item_id
+                # to guarantee global lock ordering and eliminate database deadlocks.
+                sorted_cart_items = sorted(cart.items, key=lambda ci: ci.item_id)
+
+                for cart_item in sorted_cart_items:
+                    # Lock this menu_item row for update to prevent concurrent overselling
+                    menu_item = (
+                        db.query(MenuItem)
+                        .filter(MenuItem.id == cart_item.item_id)
+                        .with_for_update()
+                        .first()
+                    )
+
+                    if not menu_item or not menu_item.is_available:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"'{cart_item.item.name}' is no longer available."
+                        )
+
+                    # Check stock if inventory tracking is enabled (stock_count != -1)
+                    if menu_item.stock_count != -1:
+                        if menu_item.stock_count < cart_item.quantity:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Insufficient stock for '{menu_item.name}'. Only {menu_item.stock_count} portions left."
+                            )
+                        # Decrement stock atomically
+                        menu_item.stock_count -= cart_item.quantity
+
+                    item_subtotal = menu_item.price * cart_item.quantity
+                    subtotal += item_subtotal
+
+                    # Snapshot item details
+                    order_items_to_create.append({
+                        "item_id": menu_item.id,
+                        "item_name": menu_item.name,
+                        "unit_price": menu_item.price,
+                        "quantity": cart_item.quantity,
+                        "subtotal": item_subtotal
+                    })
+
+                delivery_fee = 4000  # Flat ₹40.00
+                grand_total = subtotal + delivery_fee
+
+                # 5. Create Order
+                new_order = Order(
+                    user_id=current_user.id,
+                    restaurant_id=restaurant.id,
+                    delivery_address_id=address.id,
+                    delivery_address_snapshot=address_snapshot,
+                    status=OrderStatus.CREATED,
+                    subtotal=subtotal,
+                    delivery_fee=delivery_fee,
+                    grand_total=grand_total,
+                    idempotency_key=idempotency_key
+                )
+                db.add(new_order)
+                db.flush()
+
+                # Create OrderItems with snapshot values
+                for item_data in order_items_to_create:
+                    order_item = OrderItem(
+                        order_id=new_order.id,
+                        item_id=item_data["item_id"],
+                        item_name=item_data["item_name"],
+                        unit_price=item_data["unit_price"],
+                        quantity=item_data["quantity"],
+                        subtotal=item_data["subtotal"]
+                    )
+                    db.add(order_item)
+
+                # Record initial state in history
+                history_entry = OrderStatusHistory(
+                    order_id=new_order.id,
+                    old_status=None,
+                    new_status=OrderStatus.CREATED.value,
+                    changed_by_user_id=current_user.id,
+                    notes=order_in.notes or "Order placed from cart"
+                )
+                db.add(history_entry)
+
+                # 6. Clear customer's cart
+                db.query(CartItem).filter(CartItem.cart_id == cart.id).delete()
+                cart.restaurant_id = None
+
+                db.commit()
+                db.refresh(new_order)
+
+                # Step C: Save idempotency cache on success (24 hour TTL)
+                if idempotency_cache_key:
+                    set_cache(idempotency_cache_key, {"status": "COMPLETED", "order_id": new_order.id}, ttl=86400)
+
+                return new_order
+
+            except Exception:
+                db.rollback()
+                # Clear PROCESSING status if an error occurred so client can retry cleanly
+                if idempotency_cache_key:
+                    delete_cache(idempotency_cache_key)
+                raise
+
+    except TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another checkout operation is currently processing for your account. Please wait."
         )
-        db.add(order_item)
-
-    # Record initial state in history
-    history_entry = OrderStatusHistory(
-        order_id=new_order.id,
-        old_status=None,
-        new_status=OrderStatus.CREATED.value,
-        changed_by_user_id=current_user.id,
-        notes=order_in.notes or "Order placed from cart"
-    )
-    db.add(history_entry)
-
-    # 6. Clear customer's cart
-    db.query(CartItem).filter(CartItem.cart_id == cart.id).delete()
-    cart.restaurant_id = None
-
-    db.commit()
-    db.refresh(new_order)
-    return new_order
 
 
 @router.get(

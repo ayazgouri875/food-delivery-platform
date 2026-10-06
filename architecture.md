@@ -182,3 +182,80 @@ stateDiagram-v2
 * **File Reference**: [app/dependencies/rate_limiter.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/dependencies/rate_limiter.py)
 * **Concept**: Defends authentication endpoints against distributed brute-force attacks across horizontally scaled instances.
 * **Implementation**: Atomic Redis `INCR` and `EXPIRE` window tracker. Enforces 5 requests per 60 seconds per IP on `/auth/login`, returning `HTTP 429 Too Many Requests` with `Retry-After` header.
+
+### 8. Redis Distributed Locking (`SET NX EX` + Atomic Lua Release)
+* **File Reference**: [app/core/redis.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/redis.py)
+* **Concept**: When multiple backend instances service requests concurrently, critical sections across mutable distributed state (such as user cart checkout and payment processing) require mutual exclusion.
+* **Implementation**:
+  - **Acquisition**: `redis_client.set(lock_key, token, nx=True, ex=lock_timeout_seconds)`. Uses a cryptographically random UUID `token`.
+  - **Deadlock Defense**: An explicit TTL (`lock_timeout_seconds`) guarantees locks self-expire if a worker process crashes mid-transaction.
+  - **Safe Atomic Release (Lua Script)**:
+    ```lua
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+    else
+        return 0
+    end
+    ```
+    Guarantees that a process whose lock expired prematurely cannot accidentally delete a replacement lock acquired by another process.
+
+### 9. Multi-Layer Distributed Idempotency (Redis Fast-Path + DB Constraint)
+* **File Reference**: [app/routers/orders.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/orders.py), [app/models/order.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/models/order.py)
+* **Concept**: Mobile apps and browser clients routinely retry requests on network timeouts or double-tap checkout buttons. In food delivery systems, duplicate orders lead to double billing and kitchen waste.
+* **Implementation**:
+  - **Layer 1 (Redis In-Flight & Cache)**:
+    - Key: `idempotency:order:{user_id}:{idempotency_key}`
+    - If status is `COMPLETED`, the completed `order_id` is returned immediately without reaching PostgreSQL.
+    - If status is `PROCESSING`, returns `HTTP 409 Conflict` to block concurrent duplicate submissions.
+  - **Layer 2 (PostgreSQL Unique Constraint)**:
+    - Column `orders.idempotency_key VARCHAR(100) UNIQUE INDEX`.
+    - Guarantees defense-in-depth data integrity even during Redis eviction or disaster recovery.
+
+### 10. Deadlock-Free Inventory Row Locking (Deterministic Lock Ordering)
+* **File Reference**: [app/routers/orders.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/orders.py)
+* **Concept**:
+  - If Customer 1 orders items `[A, B]` and Customer 2 orders items `[B, A]`, concurrent checkouts will cause a classic **PostgreSQL Deadlock**: Customer 1 locks row A and waits for row B, while Customer 2 locks row B and waits for row A. PostgreSQL's deadlock detector must abort one transaction with `DeadlockDetected`.
+* **Implementation (Dijkstra's Resource Hierarchy)**:
+  - All items in the cart are deterministically sorted by ascending `item_id`:
+    ```python
+    sorted_cart_items = sorted(cart.items, key=lambda ci: ci.item_id)
+    ```
+  - Because all concurrent database transactions lock `menu_items` rows in strictly increasing primary key order, deadlocks are mathematically impossible.
+
+### 11. Driver Dispatch Queue Concurrency (`SELECT FOR UPDATE SKIP LOCKED`)
+* **File Reference**: [app/routers/delivery.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/delivery.py)
+* **Concept**:
+  - In a high-traffic meal rush, multiple restaurant orders are dispatched simultaneously in the same city.
+  - If multiple dispatch workers query `is_online=True AND is_busy=False` concurrently with standard `SELECT`, they all match the same rider, causing **driver double-booking**.
+  - If they use regular `FOR UPDATE`, all workers block in a lock queue waiting for the first rider.
+* **Implementation**:
+  - We use PostgreSQL's `SELECT ... FOR UPDATE SKIP LOCKED`:
+    ```python
+    partner = (
+        db.query(DeliveryPartner)
+        .filter(
+            DeliveryPartner.current_city.ilike(restaurant.city),
+            DeliveryPartner.is_online == True,
+            DeliveryPartner.is_busy == False
+        )
+        .with_for_update(skip_locked=True)
+        .first()
+    )
+    ```
+  - Worker 1 locks Rider A.
+  - Worker 2 concurrently skips locked Rider A without pausing and immediately locks Rider B.
+  - If no riders remain unlocked, it returns `None` immediately, returning `503 Service Unavailable` with zero latency and zero lock contention.
+
+---
+
+## Concurrency Test Suite Verification Matrix
+
+Automated multi-threaded test suite: [tests/test_concurrency.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/tests/test_concurrency.py)
+
+| Test Scenario | Concurrency Level | Tested Invariant | Result |
+| :--- | :--- | :--- | :--- |
+| **Overselling Prevention** | 10 parallel threads competing for 2 stock units | `SELECT FOR UPDATE` prevents negative stock; exactly 2 orders placed, 8 rejected with 400 | **100% PASS** (Final stock: 0) |
+| **Order Idempotency** | 5 simultaneous checkouts with identical key | Exactly 1 order created in DB; all 5 requests receive 201 with identical order ID | **100% PASS** (Single order created) |
+| **Payment Idempotency** | 5 concurrent payments for the same order | Distributed lock serializes payments; exactly 1 payment record created, order CONFIRMED | **100% PASS** (Single payment record) |
+| **Driver Double-Booking** | 3 concurrent order dispatches competing for 1 rider | `SKIP LOCKED` assigns rider to exactly 1 order; remaining 2 fail with 503 | **100% PASS** (Zero double-booking) |
+

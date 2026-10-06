@@ -2,6 +2,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.redis import distributed_lock
 from app.dependencies.auth import get_current_user
 from app.dependencies.database import get_db
 from app.models.order import Order, OrderStatus, OrderStatusHistory
@@ -16,7 +17,7 @@ router = APIRouter(prefix="/payments", tags=["Payments"])
     "/",
     response_model=PaymentResponse,
     status_code=status.HTTP_200_OK,
-    summary="Process payment for an order with Idempotency Key protection"
+    summary="Process payment for an order with Distributed Lock & Idempotency Key protection"
 )
 def process_payment(
     payment_in: PaymentInitiate,
@@ -24,84 +25,98 @@ def process_payment(
     current_user: User = Depends(get_current_user)
 ):
     """
-    Mock payment processing endpoint.
-    
-    IDEMPOTENCY HANDLING:
-    - Checks if the given `idempotency_key` was already used.
-    - If found, immediately returns the previously created Payment record.
-    - Prevents double charging on network retries, page refreshes, or rapid clicks.
+    Mock payment processing endpoint with production-grade concurrency controls:
+    1. Distributed Lock (Redis): Serializes payment attempts using the client's idempotency key.
+    2. Row-Level Locking (SELECT FOR UPDATE): Locks the Order row in PostgreSQL to prevent
+       concurrent duplicate payments across different keys.
+    3. Idempotent Replay: If idempotency_key was already used, safely returns previous Payment record.
     """
-    # 1. Idempotency Check
-    existing_payment = db.query(Payment).filter(
-        Payment.idempotency_key == payment_in.idempotency_key
-    ).first()
+    lock_key = f"lock:payment:{payment_in.idempotency_key}"
 
-    if existing_payment:
-        # Idempotent response: return previously processed payment directly!
-        return existing_payment
+    try:
+        with distributed_lock(lock_key, lock_timeout_seconds=10, acquire_timeout_seconds=5.0):
+            # 1. Idempotency Check (under lock)
+            existing_payment = db.query(Payment).filter(
+                Payment.idempotency_key == payment_in.idempotency_key
+            ).first()
 
-    # 2. Fetch and validate order
-    order = db.query(Order).filter(Order.id == payment_in.order_id).first()
-    if not order:
+            if existing_payment:
+                # Idempotent response: return previously processed payment directly!
+                return existing_payment
+
+            # 2. Fetch and lock order with SELECT FOR UPDATE
+            order = (
+                db.query(Order)
+                .filter(Order.id == payment_in.order_id)
+                .with_for_update()
+                .first()
+            )
+            if not order:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Order not found."
+                )
+
+            if order.user_id != current_user.id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not authorized to pay for another user's order."
+                )
+
+            if order.status != OrderStatus.CREATED:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Order is in '{order.status}' status and cannot be paid for."
+                )
+
+            # Check if a successful payment already exists for this order
+            prior_success = db.query(Payment).filter(
+                Payment.order_id == order.id,
+                Payment.status == PaymentStatus.SUCCESS
+            ).first()
+            if prior_success:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This order has already been paid for."
+                )
+
+            # 3. Simulate Payment Gateway Transaction
+            if payment_in.should_succeed:
+                txn_status = PaymentStatus.SUCCESS
+                txn_id = f"txn_mock_{uuid.uuid4().hex[:12]}"
+
+                # Transition order to CONFIRMED
+                order.status = OrderStatus.CONFIRMED
+
+                # Log state transition history
+                history = OrderStatusHistory(
+                    order_id=order.id,
+                    old_status=OrderStatus.CREATED.value,
+                    new_status=OrderStatus.CONFIRMED.value,
+                    changed_by_user_id=current_user.id,
+                    notes=f"Payment verified via {payment_in.payment_method} (Txn: {txn_id})"
+                )
+                db.add(history)
+            else:
+                txn_status = PaymentStatus.FAILED
+                txn_id = f"txn_fail_{uuid.uuid4().hex[:12]}"
+
+            # 4. Save Payment record
+            payment = Payment(
+                order_id=order.id,
+                amount=order.grand_total,
+                status=txn_status,
+                payment_method=payment_in.payment_method,
+                transaction_id=txn_id,
+                idempotency_key=payment_in.idempotency_key
+            )
+            db.add(payment)
+            db.commit()
+            db.refresh(payment)
+            return payment
+
+    except TimeoutError:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found."
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A payment transaction with this idempotency key is already processing. Please wait."
         )
-
-    if order.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not authorized to pay for another user's order."
-        )
-
-    if order.status != OrderStatus.CREATED:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Order is in '{order.status}' status and cannot be paid for."
-        )
-
-    # Check if a successful payment already exists for this order
-    prior_success = db.query(Payment).filter(
-        Payment.order_id == order.id,
-        Payment.status == PaymentStatus.SUCCESS
-    ).first()
-    if prior_success:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This order has already been paid for."
-        )
-
-    # 3. Simulate Payment Gateway Transaction
-    if payment_in.should_succeed:
-        txn_status = PaymentStatus.SUCCESS
-        txn_id = f"txn_mock_{uuid.uuid4().hex[:12]}"
-
-        # Transition order to CONFIRMED
-        order.status = OrderStatus.CONFIRMED
-
-        # Log state transition history
-        history = OrderStatusHistory(
-            order_id=order.id,
-            old_status=OrderStatus.CREATED.value,
-            new_status=OrderStatus.CONFIRMED.value,
-            changed_by_user_id=current_user.id,
-            notes=f"Payment verified via {payment_in.payment_method} (Txn: {txn_id})"
-        )
-        db.add(history)
-    else:
-        txn_status = PaymentStatus.FAILED
-        txn_id = f"txn_fail_{uuid.uuid4().hex[:12]}"
-
-    # 4. Save Payment record
-    payment = Payment(
-        order_id=order.id,
-        amount=order.grand_total,
-        status=txn_status,
-        payment_method=payment_in.payment_method,
-        transaction_id=txn_id,
-        idempotency_key=payment_in.idempotency_key
-    )
-    db.add(payment)
-    db.commit()
-    db.refresh(payment)
-    return payment

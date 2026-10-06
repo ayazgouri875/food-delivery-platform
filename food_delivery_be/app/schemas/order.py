@@ -8,6 +8,11 @@ from app.models.order import OrderStatus
 class OrderCreate(BaseModel):
     delivery_address_id: int = Field(..., description="Saved delivery address ID")
     notes: Optional[str] = Field(None, max_length=255, description="Delivery or cooking instructions")
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=128,
+        description="Client-generated unique key to prevent duplicate orders on retry or double-click"
+    )
 
 
 class OrderItemResponse(BaseModel):
@@ -47,6 +52,7 @@ class OrderResponse(BaseModel):
     subtotal: int
     delivery_fee: int
     grand_total: int
+    idempotency_key: Optional[str] = None
     items: List[OrderItemResponse] = []
     created_at: datetime
     updated_at: Optional[datetime] = None
