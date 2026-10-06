@@ -51,15 +51,20 @@ def root():
 
 @app.get("/health", tags=["General"])
 def health_check():
+    from app.core.redis import is_redis_healthy
+
+    db_status = "connected"
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-            return {
-                "status": "healthy",
-                "database": "connected"
-            }
     except Exception as e:
-        return {
-            "status": "unhealthy",
-            "database": str(e)
-        }
+        db_status = f"unhealthy: {e}"
+
+    redis_status = "connected" if is_redis_healthy() else "disconnected"
+    is_overall_healthy = (db_status == "connected" and redis_status == "connected")
+
+    return {
+        "status": "healthy" if is_overall_healthy else "degraded",
+        "database": db_status,
+        "redis": redis_status
+    }

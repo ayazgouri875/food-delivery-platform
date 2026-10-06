@@ -2,6 +2,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.redis import delete_cache
 from app.dependencies.auth import get_current_user
 from app.dependencies.database import get_db
 from app.models.menu import MenuCategory, MenuItem
@@ -55,6 +56,7 @@ def create_category(
     db.add(new_cat)
     db.commit()
     db.refresh(new_cat)
+    delete_cache(f"restaurant:{restaurant_id}:menu")
     return new_cat
 
 
@@ -112,6 +114,7 @@ def create_menu_item(
     db.add(new_item)
     db.commit()
     db.refresh(new_item)
+    delete_cache(f"restaurant:{restaurant_id}:menu")
     return new_item
 
 
@@ -155,6 +158,7 @@ def update_menu_item(
 
     db.commit()
     db.refresh(item)
+    delete_cache(f"restaurant:{item.restaurant_id}:menu")
     return item
 
 
@@ -178,6 +182,7 @@ def toggle_item_availability(
     item.is_available = avail_in.is_available
     db.commit()
     db.refresh(item)
+    delete_cache(f"restaurant:{item.restaurant_id}:menu")
     return item
 
 
@@ -197,6 +202,8 @@ def delete_menu_item(
 
     _verify_restaurant_owner(item.restaurant_id, current_user, db)
 
+    restaurant_id = item.restaurant_id
     db.delete(item)
     db.commit()
+    delete_cache(f"restaurant:{restaurant_id}:menu")
     return None

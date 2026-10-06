@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.core.security import create_access_token, hash_password, verify_password
 from app.dependencies.auth import get_current_user
 from app.dependencies.database import get_db
+from app.dependencies.rate_limiter import rate_limit
 from app.models.user import User
 from app.schemas.user import Token, UserLogin, UserRegister, UserResponse
 
@@ -74,6 +75,7 @@ def register(user_in: UserRegister, db: Session = Depends(get_db)):
 @router.post(
     "/login",
     response_model=Token,
+    dependencies=[Depends(rate_limit(max_requests=5, window_seconds=60, endpoint_tag="login"))],
     summary="Login with email and password"
 )
 def login(credentials: UserLogin, db: Session = Depends(get_db)):
@@ -112,6 +114,7 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
 @router.post(
     "/token",
     response_model=Token,
+    dependencies=[Depends(rate_limit(max_requests=5, window_seconds=60, endpoint_tag="login"))],
     summary="OAuth2 compatible token login (for Swagger UI)"
 )
 def login_for_access_token(

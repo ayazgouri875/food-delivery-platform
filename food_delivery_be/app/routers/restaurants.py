@@ -1,7 +1,9 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
+from app.core.redis import delete_cache, delete_pattern, get_cache, set_cache
 from app.dependencies.auth import get_current_user, require_role
 from app.dependencies.database import get_db
 from app.models.menu import MenuCategory, MenuItem
@@ -50,6 +52,7 @@ def create_restaurant(
     db.add(new_restaurant)
     db.commit()
     db.refresh(new_restaurant)
+    delete_pattern("restaurants:list:*")
     return new_restaurant
 
 
@@ -59,6 +62,7 @@ def create_restaurant(
     summary="Discover restaurants with city and search filters"
 )
 def list_restaurants(
+    response: Response,
     city: Optional[str] = Query(None, description="Filter by city name"),
     search: Optional[str] = Query(None, description="Search by restaurant name"),
     is_open_only: bool = Query(True, description="Only return currently open restaurants"),
@@ -69,7 +73,14 @@ def list_restaurants(
     """
     Public restaurant discovery endpoint for customers.
     Only returns approved (`is_active=True`) restaurants.
+    Uses Redis cache-aside with a 60-second TTL.
     """
+    cache_key = f"restaurants:list:{city or 'all'}:{search or 'all'}:{is_open_only}:{skip}:{limit}"
+    cached_list = get_cache(cache_key)
+    if cached_list:
+        response.headers["X-Cache"] = "HIT"
+        return cached_list
+
     query = db.query(Restaurant).filter(Restaurant.is_active == True)
 
     if city:
@@ -79,7 +90,11 @@ def list_restaurants(
     if is_open_only:
         query = query.filter(Restaurant.is_open == True)
 
-    return query.offset(skip).limit(limit).all()
+    results = query.offset(skip).limit(limit).all()
+    serialized = [RestaurantResponse.model_validate(r).model_dump(mode="json") for r in results]
+    set_cache(cache_key, serialized, ttl=60)
+    response.headers["X-Cache"] = "MISS"
+    return results
 
 
 @router.get(
@@ -102,11 +117,24 @@ def get_restaurant(restaurant_id: int, db: Session = Depends(get_db)):
     response_model=RestaurantFullMenuResponse,
     summary="View complete restaurant menu with categories and items"
 )
-def get_restaurant_menu(restaurant_id: int, db: Session = Depends(get_db)):
+def get_restaurant_menu(
+    restaurant_id: int,
+    response: Response,
+    db: Session = Depends(get_db)
+):
     """
     Public customer menu view.
-    Returns categories with their active items, plus any uncategorized items.
+    Cache-Aside Pattern:
+    1. Checks Redis for 'restaurant:{id}:menu'
+    2. Cache HIT: returns cached JSON immediately (sub-millisecond latency)
+    3. Cache MISS: queries PostgreSQL, serializes, writes to Redis with TTL, and returns
     """
+    cache_key = f"restaurant:{restaurant_id}:menu"
+    cached_menu = get_cache(cache_key)
+    if cached_menu:
+        response.headers["X-Cache"] = "HIT"
+        return cached_menu
+
     restaurant = db.query(Restaurant).filter(Restaurant.id == restaurant_id).first()
     if not restaurant:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Restaurant not found")
@@ -145,11 +173,16 @@ def get_restaurant_menu(restaurant_id: int, db: Session = Depends(get_db)):
         .all()
     )
 
-    return RestaurantFullMenuResponse(
+    menu_response = RestaurantFullMenuResponse(
         restaurant=RestaurantResponse.model_validate(restaurant),
         categories=categories_with_items,
         uncategorized_items=[MenuItemResponse.model_validate(it) for it in uncategorized]
     )
+
+    # Store in Redis with TTL (default: 300s / 5 minutes)
+    set_cache(cache_key, menu_response.model_dump(mode="json"), ttl=settings.CACHE_TTL_SECONDS)
+    response.headers["X-Cache"] = "MISS"
+    return menu_response
 
 
 @router.patch(
@@ -173,6 +206,10 @@ def update_restaurant_status(
     restaurant.is_active = status_in.is_active
     db.commit()
     db.refresh(restaurant)
+
+    # Invalidate cached menu and listings
+    delete_cache(f"restaurant:{restaurant_id}:menu")
+    delete_pattern("restaurants:list:*")
     return restaurant
 
 
@@ -203,4 +240,8 @@ def toggle_restaurant_open(
     restaurant.is_open = toggle_in.is_open
     db.commit()
     db.refresh(restaurant)
+
+    # Invalidate cached menu and listings
+    delete_cache(f"restaurant:{restaurant_id}:menu")
+    delete_pattern("restaurants:list:*")
     return restaurant
