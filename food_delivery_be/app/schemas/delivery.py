@@ -46,3 +46,22 @@ class DeliveryResponse(BaseModel):
     delivery_address: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DeliveryLocationUpdate(BaseModel):
+    latitude: float = Field(..., ge=-90.0, le=90.0, example=12.9716)
+    longitude: float = Field(..., ge=-180.0, le=180.0, example=77.5946)
+    heading: Optional[float] = Field(None, ge=0.0, le=360.0, description="Compass heading in degrees")
+    speed: Optional[float] = Field(None, ge=0.0, description="Speed in km/h or m/s")
+
+
+class DeliveryLocationResponse(BaseModel):
+    partner_id: int
+    latitude: float
+    longitude: float
+    heading: Optional[float] = None
+    speed: Optional[float] = None
+    distance_meters: Optional[float] = None
+    eta_minutes: Optional[int] = None
+    updated_at: float
+

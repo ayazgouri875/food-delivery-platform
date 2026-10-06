@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import List, Optional
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import func
 
+from app.core.events import EventType, publish_order_event
 from app.dependencies.auth import get_current_user, require_role
 from app.dependencies.database import get_db
 from app.models.delivery import Delivery, DeliveryPartner, DeliveryStatus
@@ -11,12 +12,16 @@ from app.models.order import Order, OrderStatus, OrderStatusHistory
 from app.models.restaurant import Restaurant
 from app.models.user import User, UserRole
 from app.schemas.delivery import (
+    DeliveryLocationResponse,
+    DeliveryLocationUpdate,
     DeliveryPartnerProfile,
     DeliveryPartnerResponse,
     DeliveryPartnerToggleOnline,
     DeliveryResponse,
     DeliveryStatusUpdate,
 )
+from app.services.notifications import NotificationService
+from app.services.telemetry import TelemetryService
 
 router = APIRouter(prefix="/delivery", tags=["Delivery & Fulfillment"])
 
@@ -131,6 +136,7 @@ def toggle_partner_online(
 )
 def assign_delivery_partner(
     order_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -143,6 +149,7 @@ def assign_delivery_partner(
        - is_online == True
        - is_busy == False
     4. Locks partner as busy and creates Delivery record.
+    5. Broadcasts DRIVER_ASSIGNED event and dispatches background notifications.
     """
     # Lock the Order row to prevent concurrent duplicate dispatches for the same order
     order = db.query(Order).filter(Order.id == order_id).with_for_update().first()
@@ -212,6 +219,28 @@ def assign_delivery_partner(
 
     db.commit()
     db.refresh(delivery)
+
+    # Real-Time Event & Asynchronous Dispatch Notification
+    publish_order_event(
+        order_id=order.id,
+        event_type=EventType.DRIVER_ASSIGNED,
+        data={
+            "order_id": order.id,
+            "delivery_id": delivery.id,
+            "partner_id": partner.id,
+            "driver_name": partner.user.name,
+            "vehicle_type": partner.vehicle_type,
+            "vehicle_number": partner.vehicle_number
+        }
+    )
+    background_tasks.add_task(
+        NotificationService.send_driver_assigned,
+        order.id,
+        order.user_id,
+        partner.user.name,
+        partner.vehicle_number
+    )
+
     return _build_delivery_response(delivery)
 
 
@@ -240,6 +269,7 @@ def list_my_deliveries(
 def update_delivery_status(
     delivery_id: int,
     status_in: DeliveryStatusUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role([UserRole.DELIVERY_PARTNER, UserRole.ADMIN]))
 ):
@@ -271,6 +301,23 @@ def update_delivery_status(
             )
             db.add(history)
 
+            # Broadcast real-time event & async notification
+            publish_order_event(
+                order_id=order.id,
+                event_type=EventType.ORDER_PICKED_UP,
+                data={
+                    "order_id": order.id,
+                    "delivery_id": delivery.id,
+                    "driver_name": partner.user.name if partner and partner.user else "Delivery Partner"
+                }
+            )
+            background_tasks.add_task(
+                NotificationService.send_order_picked_up,
+                order.id,
+                order.user_id,
+                partner.user.name if partner and partner.user else "Delivery Partner"
+            )
+
     elif status_in.status == DeliveryStatus.DELIVERED:
         delivery.status = DeliveryStatus.DELIVERED
         delivery.delivered_at = now
@@ -292,6 +339,89 @@ def update_delivery_status(
             )
             db.add(history)
 
+            # Broadcast real-time event & async notification
+            publish_order_event(
+                order_id=order.id,
+                event_type=EventType.ORDER_DELIVERED,
+                data={
+                    "order_id": order.id,
+                    "delivery_id": delivery.id,
+                    "delivered_at": str(now)
+                }
+            )
+            background_tasks.add_task(
+                NotificationService.send_order_delivered,
+                order.id,
+                order.user_id,
+                order.user.email if order.user else "",
+                order.grand_total
+            )
+
     db.commit()
     db.refresh(delivery)
     return _build_delivery_response(delivery)
+
+
+@router.post(
+    "/location",
+    response_model=DeliveryLocationResponse,
+    summary="Driver GPS Telemetry Ping (Updates Redis Geospatial & broadcasts live location)"
+)
+def update_driver_location(
+    location_in: DeliveryLocationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role([UserRole.DELIVERY_PARTNER]))
+):
+    """
+    Rider GPS Ping Endpoint.
+    1. Indexes coordinates in Redis Geospatial (GEOADD).
+    2. Checks if driver has an active delivery (ASSIGNED or PICKED_UP).
+    3. Calculates real-time distance & estimated time of arrival (ETA).
+    4. Streams live GPS coordinates and ETA to the customer's WebSocket via Redis Pub/Sub!
+    """
+    partner = db.query(DeliveryPartner).filter(DeliveryPartner.user_id == current_user.id).first()
+    if not partner:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Delivery partner profile not found.")
+
+    # Find active delivery assigned to this rider
+    active_delivery = db.query(Delivery).filter(
+        Delivery.partner_id == partner.id,
+        Delivery.status.in_([DeliveryStatus.ASSIGNED, DeliveryStatus.PICKED_UP])
+    ).first()
+
+    active_order_id = None
+    dest_lat = None
+    dest_lon = None
+
+    if active_delivery and active_delivery.order:
+        active_order_id = active_delivery.order.id
+        # If heading to restaurant for pickup:
+        if active_delivery.status == DeliveryStatus.ASSIGNED and active_delivery.order.restaurant:
+            dest_lat = float(active_delivery.order.restaurant.latitude) if active_delivery.order.restaurant.latitude else None
+            dest_lon = float(active_delivery.order.restaurant.longitude) if active_delivery.order.restaurant.longitude else None
+        # If order already picked up and heading to customer address:
+        elif active_delivery.status == DeliveryStatus.PICKED_UP and active_delivery.order.delivery_address_id:
+            dest_lat = float(active_delivery.order.delivery_address.latitude) if (active_delivery.order.delivery_address and active_delivery.order.delivery_address.latitude) else None
+            dest_lon = float(active_delivery.order.delivery_address.longitude) if (active_delivery.order.delivery_address and active_delivery.order.delivery_address.longitude) else None
+
+    telemetry = TelemetryService.record_partner_location(
+        partner_id=partner.id,
+        latitude=location_in.latitude,
+        longitude=location_in.longitude,
+        heading=location_in.heading,
+        speed=location_in.speed,
+        active_order_id=active_order_id,
+        dest_latitude=dest_lat,
+        dest_longitude=dest_lon
+    )
+
+    return DeliveryLocationResponse(
+        partner_id=partner.id,
+        latitude=telemetry["latitude"],
+        longitude=telemetry["longitude"],
+        heading=telemetry.get("heading"),
+        speed=telemetry.get("speed"),
+        distance_meters=telemetry.get("distance_meters"),
+        eta_minutes=telemetry.get("eta_minutes"),
+        updated_at=telemetry["updated_at"]
+    )

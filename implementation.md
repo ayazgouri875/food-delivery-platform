@@ -254,6 +254,13 @@ The security architecture is decoupled into **Cryptographic Utilities** and **Fa
 | `POST` | `/delivery/assign/{order_id}` | Authenticated | **Order Row Lock + Partner `SELECT FOR UPDATE SKIP LOCKED`** | None | `DeliveryResponse` | `200 OK` (or `503`) |
 | `GET` | `/delivery/my-deliveries` | `DELIVERY_PARTNER` | None | None | `List[DeliveryResponse]` | `200 OK` |
 | `PATCH` | `/delivery/{id}/status` | `DELIVERY_PARTNER`, `ADMIN` | Syncs `order.status` & releases partner lock | `DeliveryStatusUpdate` | `DeliveryResponse` | `200 OK` |
+| `POST` | `/delivery/location` | `DELIVERY_PARTNER` | **Redis Geospatial Index + Live Pub/Sub Telemetry** | `DeliveryLocationUpdate` (lat, lon, heading, speed) | `DeliveryLocationResponse` | `200 OK` |
+
+### 10. Real-Time WebSockets & Notifications Domain ([app/routers/websockets.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/websockets.py))
+| Protocol | Endpoint | Access | Real-Time Broker | Request Body / Params | Event Payload |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `WS` | `/ws/orders/{order_id}` | Participant or `ADMIN` | **Redis Pub/Sub (`channel:order:{id}`)** | `token: str` (JWT Query or Header) | Streams `ORDER_*`, `DRIVER_*`, `PAYMENT_*` payloads |
+| `GET` | `/ws/notifications` | Authenticated | Redis Inbox (`notifications:user:{id}`) | `limit: int` (default 20) | User notification history |
 
 ---
 
@@ -267,4 +274,17 @@ The security architecture is decoupled into **Cryptographic Utilities** and **Fa
 | **Driver Double-Booking Defense** | [app/routers/delivery.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/delivery.py#L173-L188) | `DeliveryPartner.with_for_update(skip_locked=True)` + `Order.with_for_update()` | Parallel dispatch workers claim different riders simultaneously; zero contention |
 | **Payment Deduplication** | [app/routers/payments.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/payments.py#L22-L46) | `distributed_lock(f"lock:payment:{key}")` + `Order.with_for_update()` | Prevents duplicate card/UPI debits and duplicate order confirmations |
 | **Automated Concurrency Tests** | [tests/test_concurrency.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/tests/test_concurrency.py) | `concurrent.futures.ThreadPoolExecutor` against live FastAPI + PostgreSQL + Redis | Automated stress testing: 10 parallel checkouts, 5 double taps, 3 dispatch races |
+
+---
+
+## Stage 4: Real-Time Event-Driven Architecture File Map
+
+| Mechanism | Primary Source File | Technical Strategy | System Guarantee |
+| :--- | :--- | :--- | :--- |
+| **Redis Pub/Sub Event Bus** | [app/core/events.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/events.py) | `redis_client.publish(channel, json)` + `rpush(timeline_key)` | Sub-millisecond distributed pub/sub; durable replay on reconnection |
+| **WebSocket Order Tracking** | [app/routers/websockets.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/websockets.py) | `redis.asyncio` pubsub listener in async task forwarder | Zero database polling; horizontal scalability across multiple app servers |
+| **Driver Geolocation Telemetry** | [app/services/telemetry.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/services/telemetry.py) | `GEOADD geo:delivery_partners` + Haversine formula distance & ETA | Real-time GPS indexing without relational database disk contention |
+| **Decoupled Notifications** | [app/services/notifications.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/services/notifications.py) | FastAPI `BackgroundTasks` + Redis user inbox queues | Non-blocking external notification delivery; instant API response times |
+| **Real-Time Integration Tests** | [tests/test_stage4_events.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/tests/test_stage4_events.py) | Async `websockets` client listening while HTTP transactions execute | 9-step full lifecycle test covering WS handshake, payments, kitchen, GPS, and delivery |
+
 

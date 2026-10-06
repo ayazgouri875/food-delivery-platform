@@ -1,7 +1,8 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.events import EventType, publish_order_event
 from app.core.redis import delete_cache, distributed_lock, get_cache, set_cache
 from app.dependencies.auth import get_current_user
 from app.dependencies.database import get_db
@@ -17,6 +18,7 @@ from app.schemas.order import (
     OrderResponse,
     OrderStatusUpdate,
 )
+from app.services.notifications import NotificationService
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -40,6 +42,7 @@ VALID_TRANSITIONS = {
 )
 def place_order(
     order_in: OrderCreate,
+    background_tasks: BackgroundTasks,
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -221,6 +224,25 @@ def place_order(
                 if idempotency_cache_key:
                     set_cache(idempotency_cache_key, {"status": "COMPLETED", "order_id": new_order.id}, ttl=86400)
 
+                # Step D: Real-Time Event & Asynchronous Notification
+                publish_order_event(
+                    order_id=new_order.id,
+                    event_type=EventType.ORDER_CREATED,
+                    data={
+                        "order_id": new_order.id,
+                        "status": new_order.status.value,
+                        "grand_total": new_order.grand_total,
+                        "restaurant_id": new_order.restaurant_id
+                    }
+                )
+                background_tasks.add_task(
+                    NotificationService.send_order_placed,
+                    new_order.id,
+                    current_user.id,
+                    current_user.email,
+                    new_order.grand_total
+                )
+
                 return new_order
 
             except Exception:
@@ -334,6 +356,19 @@ def update_order_status(
     db.add(history)
     db.commit()
     db.refresh(order)
+
+    # Real-Time Event Broadcast to WebSockets
+    publish_order_event(
+        order_id=order.id,
+        event_type=f"ORDER_{new_status.value}",
+        data={
+            "order_id": order.id,
+            "old_status": old_status.value,
+            "new_status": new_status.value,
+            "notes": status_in.notes
+        }
+    )
+
     return order
 
 
@@ -383,4 +418,17 @@ def cancel_order(
     db.add(history)
     db.commit()
     db.refresh(order)
+
+    # Real-Time Event Broadcast
+    publish_order_event(
+        order_id=order.id,
+        event_type=EventType.ORDER_CANCELLED,
+        data={
+            "order_id": order.id,
+            "old_status": old_status.value,
+            "new_status": OrderStatus.CANCELLED.value,
+            "reason": notes
+        }
+    )
+
     return order

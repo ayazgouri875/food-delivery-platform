@@ -14,6 +14,7 @@ from app.routers import (
     payments_router,
     restaurants_router,
     users_router,
+    websockets_router,
 )
 
 app = FastAPI(
@@ -37,6 +38,8 @@ app.include_router(address_router)
 app.include_router(orders_router)
 app.include_router(payments_router)
 app.include_router(delivery_router)
+app.include_router(websockets_router)
+
 
 
 @app.get("/", tags=["General"])

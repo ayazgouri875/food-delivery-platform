@@ -1,7 +1,8 @@
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.events import EventType, publish_order_event
 from app.core.redis import distributed_lock
 from app.dependencies.auth import get_current_user
 from app.dependencies.database import get_db
@@ -9,6 +10,7 @@ from app.models.order import Order, OrderStatus, OrderStatusHistory
 from app.models.payment import Payment, PaymentStatus
 from app.models.user import User
 from app.schemas.payment import PaymentInitiate, PaymentResponse
+from app.services.notifications import NotificationService
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
@@ -21,6 +23,7 @@ router = APIRouter(prefix="/payments", tags=["Payments"])
 )
 def process_payment(
     payment_in: PaymentInitiate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -113,6 +116,35 @@ def process_payment(
             db.add(payment)
             db.commit()
             db.refresh(payment)
+
+            # Step 5: Real-Time Event Broadcast & Kitchen Alert
+            if txn_status == PaymentStatus.SUCCESS:
+                publish_order_event(
+                    order_id=order.id,
+                    event_type=EventType.PAYMENT_SUCCESS,
+                    data={
+                        "order_id": order.id,
+                        "payment_id": payment.id,
+                        "transaction_id": txn_id,
+                        "amount": order.grand_total
+                    }
+                )
+                publish_order_event(
+                    order_id=order.id,
+                    event_type=EventType.ORDER_CONFIRMED,
+                    data={
+                        "order_id": order.id,
+                        "status": OrderStatus.CONFIRMED.value
+                    }
+                )
+                restaurant_name = order.restaurant.name if order.restaurant else "Kitchen"
+                background_tasks.add_task(
+                    NotificationService.send_order_confirmed,
+                    order.id,
+                    order.user_id,
+                    restaurant_name
+                )
+
             return payment
 
     except TimeoutError:

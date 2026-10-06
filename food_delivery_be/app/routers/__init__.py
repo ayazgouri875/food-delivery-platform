@@ -7,6 +7,7 @@ from app.routers.orders import router as orders_router
 from app.routers.payments import router as payments_router
 from app.routers.restaurants import router as restaurants_router
 from app.routers.users import router as users_router
+from app.routers.websockets import router as websockets_router
 
 __all__ = [
     "auth_router",
@@ -18,4 +19,6 @@ __all__ = [
     "orders_router",
     "payments_router",
     "delivery_router",
+    "websockets_router",
 ]
+
