@@ -20,6 +20,7 @@ from app.schemas.delivery import (
     DeliveryResponse,
     DeliveryStatusUpdate,
 )
+from app.core.metrics import DELIVERY_DISPATCHES_TOTAL
 from app.services.notifications import NotificationService
 from app.services.telemetry import TelemetryService
 
@@ -240,6 +241,9 @@ def assign_delivery_partner(
         partner.user.name,
         partner.vehicle_number
     )
+
+    # Record Prometheus Metric
+    DELIVERY_DISPATCHES_TOTAL.labels(city=restaurant.city).inc()
 
     return _build_delivery_response(delivery)
 

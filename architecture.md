@@ -291,6 +291,52 @@ Automated multi-threaded test suite: [tests/test_concurrency.py](file:///Users/m
   - Leverages FastAPI's `BackgroundTasks` to offload notification formatting and dispatch outside the request-response thread.
   - Pushes audit copies to Redis inbox `notifications:user:{user_id}` and `notifications:audit_log`, providing immediate sub-millisecond API response times (`<20ms`).
 
+### 15. Prometheus Telemetry & Metrics Instrumentation
+* **File Reference**: [app/core/metrics.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/metrics.py), [app/main.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/main.py#L62-L66)
+* **Concept**:
+  - Production distributed systems require real-time visibility into traffic, latency distributions, saturation, and business KPIs.
+* **Implementation**:
+  - Exposes standard text exposition endpoint `GET /metrics` scraped by Prometheus.
+  - **Latency & Traffic Histograms**: `http_requests_total` labeled by `(method, endpoint, status_code)` and `http_request_duration_seconds` histogram with sub-10ms buckets.
+  - **Endpoint Normalization**: Resolves URL paths against FastAPI route patterns (`/orders/{order_id}` rather than raw `/orders/123`) to prevent high-cardinality metric explosion.
+  - **Business Domain KPIs**:
+    - `food_delivery_orders_created_total`: Orders placed.
+    - `food_delivery_order_revenue_paise_total`: Gross merchandise value (GMV) transacted.
+    - `food_delivery_payments_processed_total`: Payment gateway volume by status and method.
+    - `food_delivery_dispatches_total`: Driver dispatches executed per city.
+    - `food_delivery_active_websocket_connections`: Active real-time WebSocket client sessions.
+    - `food_delivery_circuit_breaker_state`: Real-time state gauge (0=CLOSED, 1=HALF_OPEN, 2=OPEN).
+
+### 16. Distributed Tracing & Correlation ID Middleware
+* **File Reference**: [app/core/logging_middleware.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/logging_middleware.py)
+* **Concept**:
+  - Microservices and distributed clients require end-to-end trace correlation to debug slow requests and exceptions across boundaries.
+* **Implementation**:
+  - `RequestTracingMiddleware` extracts `X-Request-ID` from incoming HTTP headers or generates a unique `req_<uuid16>` identifier.
+  - Attaches `request_id` to `request.state` for all downstream controllers, services, and loggers.
+  - Injects `X-Request-ID` into outgoing HTTP response headers.
+  - Emits structured JSON access logs with timestamp, duration in ms, route, client IP, and status code.
+
+### 17. Fault Tolerance & Circuit Breaker Pattern
+* **File Reference**: [app/core/circuit_breaker.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/circuit_breaker.py), [app/routers/payments.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/payments.py#L90-L108)
+* **Concept**:
+  - Cascading failures occur when downstream external systems (Payment Gateways, SMS aggregators, Geospatial APIs) degrade or time out, tying up connection pools and worker threads.
+* **Implementation**:
+  - 3-State Finite State Machine (`CLOSED` $\rightarrow$ `OPEN` $\rightarrow$ `HALF_OPEN`):
+    - **CLOSED (Normal)**: Calls pass through. Consecutive failures increment error counter.
+    - **OPEN (Tripped)**: Upon reaching `failure_threshold` (default 3), circuit trips to OPEN. All subsequent requests are rejected immediately in $<1\text{ms}$ with `HTTP 503 Service Unavailable` and a `Retry-After: <seconds>` header without calling the degraded dependency.
+    - **HALF_OPEN (Trial)**: After `recovery_timeout_seconds` (default 10s), the next call is allowed through as a canary probe. If successful, circuit heals to `CLOSED` and resets error counter; if it fails, it immediately returns to `OPEN`.
+
+### 18. Containerization, Cloud-Native Deployment & Orchestration
+* **File Reference**: [Dockerfile](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/Dockerfile), [docker-compose.yml](file:///Users/macbookpro/Desktop/food-delivery-platform/docker-compose.yml), [monitoring/prometheus.yml](file:///Users/macbookpro/Desktop/food-delivery-platform/monitoring/prometheus.yml)
+* **Implementation**:
+  - **Multi-stage Dockerfile**: Clean build stage compiling Python wheels; slim runtime stage containing only pre-built wheels and application code.
+  - **Security Hardening**: Runs as unprivileged non-root user `appuser` (UID 1001), preventing container breakout risks.
+  - **Kubernetes-Compliant Probes**:
+    - `GET /health/live`: Liveness probe verifying process responsiveness.
+    - `GET /health/ready`: Readiness probe verifying PostgreSQL connection and Redis ping before receiving ingress traffic.
+  - **Docker Compose Stack**: Single-command orchestrator wiring `PostgreSQL 16`, `Redis 7`, `FastAPI backend`, and `Prometheus` with native healthchecks and volume persistence.
+
 ---
 
 ## Stage 4 Real-Time & Event-Driven Verification Matrix
@@ -308,5 +354,21 @@ Automated end-to-end WebSocket and event test suite: [tests/test_stage4_events.p
 | **Step 7** | `PATCH /delivery/{id}/status` | `ORDER_PICKED_UP` pushed over socket | **100% PASS** |
 | **Step 8** | `PATCH /delivery/{id}/status` | `ORDER_DELIVERED` final completion event pushed | **100% PASS** |
 | **Step 9** | `GET /ws/notifications` | Verified 4 asynchronous notifications in user's Redis inbox | **100% PASS** |
+
+---
+
+## Stage 5 Observability & Reliability Verification Matrix
+
+Automated verification suite: [tests/test_stage5_observability.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/tests/test_stage5_observability.py)
+
+| Test Step | Target Component | Invariant / Behavior Verified | Result |
+| :--- | :--- | :--- | :--- |
+| **Test 1** | `GET /health/live` | Returns HTTP 200 `{"status": "alive"}` and includes `X-Request-ID` header | **100% PASS** |
+| **Test 2** | `GET /health/ready` | Confirms PostgreSQL and Redis connectivity before ingress readiness | **100% PASS** |
+| **Test 3** | Tracing Middleware | Custom `X-Request-ID` header is propagated from request to response | **100% PASS** |
+| **Test 4** | `GET /metrics` | Exposes standard Prometheus text metrics (counters, gauges, histograms) | **100% PASS** |
+| **Test 5** | `CircuitBreaker` FSM | State transitions: `CLOSED` $\rightarrow$ 3 failures $\rightarrow$ `OPEN` $\rightarrow$ timeout $\rightarrow$ `HALF_OPEN` $\rightarrow$ `CLOSED` | **100% PASS** |
+| **Test 6** | `POST /payments` | Tripping circuit breaker returns HTTP 503 with `Retry-After`; updates Prometheus gauge to 2.0 | **100% PASS** |
+
 
 

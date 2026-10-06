@@ -37,11 +37,12 @@ def setup_stage4_test_data():
     db.add(customer)
     db.flush()
 
+    test_city = f"City_{ts}"
     address = Address(
         user_id=customer.id,
         title="Home",
         address_line="12th Main Indiranagar",
-        city="Bengaluru_Live",
+        city=test_city,
         postal_code="560038"
     )
     db.add(address)
@@ -60,7 +61,7 @@ def setup_stage4_test_data():
     restaurant = Restaurant(
         owner_id=owner.id,
         name=f"Luigi Pizzeria {ts}",
-        city="Bengaluru_Live",
+        city=test_city,
         address_line="100 Feet Road, Indiranagar",
         latitude=12.9784,
         longitude=77.6408,
@@ -100,7 +101,7 @@ def setup_stage4_test_data():
         user_id=rider_user.id,
         vehicle_type="Electric Scooter",
         vehicle_number="KA-03-EV-9999",
-        current_city="Bengaluru_Live",
+        current_city=test_city,
         is_online=True,
         is_busy=False
     )

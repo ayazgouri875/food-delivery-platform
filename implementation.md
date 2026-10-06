@@ -262,6 +262,14 @@ The security architecture is decoupled into **Cryptographic Utilities** and **Fa
 | `WS` | `/ws/orders/{order_id}` | Participant or `ADMIN` | **Redis Pub/Sub (`channel:order:{id}`)** | `token: str` (JWT Query or Header) | Streams `ORDER_*`, `DRIVER_*`, `PAYMENT_*` payloads |
 | `GET` | `/ws/notifications` | Authenticated | Redis Inbox (`notifications:user:{id}`) | `limit: int` (default 20) | User notification history |
 
+### 11. Observability, Telemetry & Reliability Domain ([app/main.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/main.py))
+| Method | Endpoint | Access | Purpose | Prometheus Output / Response |
+| :--- | :--- | :--- | :--- | :--- |
+| `GET` | `/metrics` | Public / Scraper | Prometheus Text Exposition | Counters (`http_requests_total`, orders, payments), Latency histograms, Gauges |
+| `GET` | `/health` | Public | Platform Status Overview | DB and Redis connection states |
+| `GET` | `/health/live` | Public | Kubernetes Liveness Probe | `{"status": "alive"}` (HTTP 200) |
+| `GET` | `/health/ready` | Public | Kubernetes Readiness Probe | `{"status": "ready", "database": "connected", "redis": "connected"}` (or HTTP 503) |
+
 ---
 
 ## Stage 3: Concurrency & Distributed Consistency File Map
@@ -286,5 +294,21 @@ The security architecture is decoupled into **Cryptographic Utilities** and **Fa
 | **Driver Geolocation Telemetry** | [app/services/telemetry.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/services/telemetry.py) | `GEOADD geo:delivery_partners` + Haversine formula distance & ETA | Real-time GPS indexing without relational database disk contention |
 | **Decoupled Notifications** | [app/services/notifications.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/services/notifications.py) | FastAPI `BackgroundTasks` + Redis user inbox queues | Non-blocking external notification delivery; instant API response times |
 | **Real-Time Integration Tests** | [tests/test_stage4_events.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/tests/test_stage4_events.py) | Async `websockets` client listening while HTTP transactions execute | 9-step full lifecycle test covering WS handshake, payments, kitchen, GPS, and delivery |
+
+---
+
+## Stage 5: Reliability, Observability & Fault Tolerance File Map
+
+| Mechanism | Primary Source File | Technical Strategy | System Guarantee |
+| :--- | :--- | :--- | :--- |
+| **Prometheus Metrics** | [app/core/metrics.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/metrics.py) | `prometheus_client` Counters, Histograms, Gauges + URL normalization | Zero high-cardinality leak; live latency distributions & business KPIs |
+| **Correlation ID Tracing** | [app/core/logging_middleware.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/logging_middleware.py) | `RequestTracingMiddleware` with `X-Request-ID` extraction & generation | End-to-end audit tracing with structured JSON access logs across all calls |
+| **Circuit Breaker** | [app/core/circuit_breaker.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/core/circuit_breaker.py) | 3-state state machine (`CLOSED`, `OPEN`, `HALF_OPEN`) with canary recovery | Eliminates cascading worker thread exhaustion during external gateway outages |
+| **Payment Gateway Protection** | [app/routers/payments.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/app/routers/payments.py#L90-L108) | Wraps third-party call in `gateway_breaker.call()` | Returns immediate `503 + Retry-After` on degradation; auto-heals |
+| **Multi-Stage Container** | [food_delivery_be/Dockerfile](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/Dockerfile) | Build stage + non-root runner stage (`appuser` UID 1001) | Security-hardened minimal container image with built-in healthcheck |
+| **Docker Compose** | [docker-compose.yml](file:///Users/macbookpro/Desktop/food-delivery-platform/docker-compose.yml) | Postgres 16 + Redis 7 + FastAPI API + Prometheus 9090 | Single-command full-stack container orchestration with health dependency checks |
+| **Prometheus Config** | [monitoring/prometheus.yml](file:///Users/macbookpro/Desktop/food-delivery-platform/monitoring/prometheus.yml) | Periodic 5s/15s scrape interval targeting `/metrics` | Production time-series telemetry ready for Grafana dashboards |
+| **Observability Test Suite** | [tests/test_stage5_observability.py](file:///Users/macbookpro/Desktop/food-delivery-platform/food_delivery_be/tests/test_stage5_observability.py) | Integration test validating probes, correlation IDs, scrape format & circuit trips | 100% pass verification of all Stage 5 reliability mechanisms |
+
 
 

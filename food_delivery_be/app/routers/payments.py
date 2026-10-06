@@ -2,7 +2,9 @@ import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.circuit_breaker import CircuitBreakerOpenException, get_circuit_breaker
 from app.core.events import EventType, publish_order_event
+from app.core.metrics import PAYMENTS_PROCESSED_TOTAL
 from app.core.redis import distributed_lock
 from app.dependencies.auth import get_current_user
 from app.dependencies.database import get_db
@@ -83,7 +85,28 @@ def process_payment(
                     detail="This order has already been paid for."
                 )
 
-            # 3. Simulate Payment Gateway Transaction
+            # 3. Simulate External Payment Gateway Transaction protected by Circuit Breaker
+            gateway_breaker = get_circuit_breaker("payment_gateway", failure_threshold=3, recovery_timeout_seconds=5.0)
+
+            def _call_gateway():
+                if payment_in.simulate_gateway_outage:
+                    raise RuntimeError("Downstream Payment Provider 502 Bad Gateway / Network Timeout")
+                return True
+
+            try:
+                gateway_breaker.call(_call_gateway)
+            except CircuitBreakerOpenException as cbe:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    headers={"Retry-After": str(int(cbe.retry_after_seconds))},
+                    detail=f"Payment Gateway is currently degraded (Circuit Breaker OPEN). Retry in {cbe.retry_after_seconds}s."
+                )
+            except RuntimeError as rte:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=str(rte)
+                )
+
             if payment_in.should_succeed:
                 txn_status = PaymentStatus.SUCCESS
                 txn_id = f"txn_mock_{uuid.uuid4().hex[:12]}"
@@ -116,6 +139,12 @@ def process_payment(
             db.add(payment)
             db.commit()
             db.refresh(payment)
+
+            # Record Prometheus business metric
+            PAYMENTS_PROCESSED_TOTAL.labels(
+                status=txn_status.value,
+                payment_method=payment_in.payment_method
+            ).inc()
 
             # Step 5: Real-Time Event Broadcast & Kitchen Alert
             if txn_status == PaymentStatus.SUCCESS:

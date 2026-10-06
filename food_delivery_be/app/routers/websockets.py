@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.events import get_order_channel, get_order_timeline
+from app.core.metrics import ACTIVE_WS_CONNECTIONS
 from app.core.security import decode_access_token
 from app.database.session import SessionLocal
 from app.dependencies.auth import get_current_user
@@ -91,6 +92,7 @@ async def order_live_tracking_websocket(
 
     # Step 3: Accept connection & send initial snapshot
     await websocket.accept()
+    ACTIVE_WS_CONNECTIONS.inc()
     logger.info(f"WebSocket client connected for order #{order_id} (User ID: {user_id})")
 
     # Send initial state snapshot and timeline history
@@ -154,6 +156,7 @@ async def order_live_tracking_websocket(
         for task in pending:
             task.cancel()
     finally:
+        ACTIVE_WS_CONNECTIONS.dec()
         logger.info(f"WebSocket client disconnected for order #{order_id} (User ID: {user_id})")
         try:
             await pubsub.unsubscribe(channel_name)

@@ -3,6 +3,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, 
 from sqlalchemy.orm import Session
 
 from app.core.events import EventType, publish_order_event
+from app.core.metrics import ORDERS_CREATED_TOTAL, ORDER_REVENUE_PAISE_TOTAL
 from app.core.redis import delete_cache, distributed_lock, get_cache, set_cache
 from app.dependencies.auth import get_current_user
 from app.dependencies.database import get_db
@@ -242,6 +243,10 @@ def place_order(
                     current_user.email,
                     new_order.grand_total
                 )
+
+                # Record Prometheus Business Metrics
+                ORDERS_CREATED_TOTAL.inc()
+                ORDER_REVENUE_PAISE_TOTAL.inc(new_order.grand_total)
 
                 return new_order
 

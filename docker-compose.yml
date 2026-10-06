@@ -1,0 +1,98 @@
+version: "3.8"
+
+services:
+  # -------------------------------------------------------------
+  # 1. PostgreSQL 16 Relational Database Engine
+  # -------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: food_delivery_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: food_delivery
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d food_delivery"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # -------------------------------------------------------------
+  # 2. Redis 7 High-Performance In-Memory Cache & Event Bus
+  # -------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: food_delivery_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # -------------------------------------------------------------
+  # 3. FastAPI Application Backend (Multi-stage non-root container)
+  # -------------------------------------------------------------
+  api:
+    build:
+      context: ./food_delivery_be
+      dockerfile: Dockerfile
+    container_name: food_delivery_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/food_delivery
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=super-secret-jwt-key-food-delivery-production-2026
+      - ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=1440
+      - ENVIRONMENT=production
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # -------------------------------------------------------------
+  # 4. Prometheus Time-Series Telemetry & Metrics Scraper
+  # -------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: food_delivery_prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
